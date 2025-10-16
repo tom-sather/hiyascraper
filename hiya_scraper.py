@@ -13,7 +13,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 
 class HiyaScraper:
     def __init__(self, headless=False):
@@ -46,7 +46,72 @@ class HiyaScraper:
         
         self.wait = WebDriverWait(self.driver, 15)
         self.data = []
-        
+
+    def _has_data_rows(self, driver):
+        """Return True if the table currently has at least one populated data row."""
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+            if not rows:
+                # Some tables use ARIA roles instead of <table>
+                rows = [
+                    row for row in driver.find_elements(By.CSS_SELECTOR, "[role='row']")
+                    if row.find_elements(By.CSS_SELECTOR, "[role='cell']")
+                ]
+
+            for row in rows:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if not cells:
+                    cells = row.find_elements(By.CSS_SELECTOR, "[role='cell']")
+
+                if len(cells) > 1 and cells[1].text.strip():
+                    return True
+        except StaleElementReferenceException:
+            return False
+
+        return False
+
+    def _has_empty_message(self, driver):
+        """Return True if the empty state banner is visible on the page."""
+        try:
+            return bool(
+                driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(text(), \"don't currently have any registered phone numbers\") or contains(text(), 'no registered phone numbers')]"
+                )
+            )
+        except StaleElementReferenceException:
+            return False
+
+    def _wait_for_table_ready(self):
+        """Wait for the table to either show data rows or an empty-state message."""
+        try:
+            WebDriverWait(
+                self.driver,
+                15,
+                ignored_exceptions=(StaleElementReferenceException,),
+            ).until(
+                lambda d: d.find_elements(By.TAG_NAME, "table")
+                or d.find_elements(By.CSS_SELECTOR, "[role='grid'] [role='row']")
+            )
+        except TimeoutException:
+            print("⚠️  Timeout waiting for table or grid to appear")
+            return "timeout"
+
+        try:
+            WebDriverWait(
+                self.driver,
+                20,
+                ignored_exceptions=(StaleElementReferenceException,)
+            ).until(lambda d: self._has_data_rows(d) or self._has_empty_message(d))
+        except TimeoutException:
+            print("⚠️  Timeout waiting for table data to load")
+            return "timeout"
+
+        if self._has_empty_message(self.driver):
+            return "empty"
+
+        return "data"
+
     def login(self, username, password):
         """Login to Hiya dashboard using Auth0"""
         print("Navigating to Hiya login page...")
@@ -95,20 +160,13 @@ class HiyaScraper:
         url = self.get_page_url(page_num)
         print(f"Navigating to page {page_num + 1}...")
         self.driver.get(url)
-        
-        # Wait for page to load
-        time.sleep(3)
-        
-        # Wait for table content
-        try:
-            self.wait.until(
-                lambda d: d.find_elements(By.TAG_NAME, "table") or
-                         d.find_elements(By.XPATH, "//*[contains(text(), 'Phone number')]")
-            )
-            time.sleep(2)  # Extra wait for dynamic content
-        except TimeoutException:
-            print("⚠️  Timeout waiting for page content")
-    
+
+        state = self._wait_for_table_ready()
+        if state == "empty":
+            print("📭 This page reports no registered phone numbers.")
+        elif state == "timeout":
+            print("⚠️  Unable to confirm table data loaded before timing out.")
+
     def get_total_pages(self):
         """Get the total number of pages from pagination"""
         try:
@@ -139,27 +197,22 @@ class HiyaScraper:
     def scrape_current_page(self):
         """Scrape data from the current page"""
         try:
-            # Wait for any loading to complete
-            time.sleep(2)
-            
-            # Check if page shows "no registered phone numbers" message
-            try:
-                empty_message = self.driver.find_element(By.XPATH, "//*[contains(text(), \"don't currently have any registered phone numbers\") or contains(text(), 'no registered phone numbers')]")
-                if empty_message:
-                    print("📭 Found 'no registered phone numbers' message - reached end of data")
-                    return -1  # Special return value to indicate we should stop
-            except NoSuchElementException:
-                pass  # Message not found, continue normally
-            
+            state = self._wait_for_table_ready()
+
+            if state == "empty":
+                print("📭 Found 'no registered phone numbers' message - reached end of data")
+                return -1
+
+            if state == "timeout":
+                return 0
+
             # Scroll to load any lazy content
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
             self.driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(1)
-            
+
             # Find all rows
             rows = []
-            
+
             try:
                 table = self.driver.find_element(By.TAG_NAME, "table")
                 rows = table.find_elements(By.CSS_SELECTOR, "tbody tr")
